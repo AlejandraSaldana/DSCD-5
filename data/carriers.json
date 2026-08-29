@@ -1,0 +1,4 @@
+{
+    "DHL": {"carrier_name": "DHL Express", "country": "Germany"},
+    "FDX": {"carrier_name": "FedEx", "country": "USA"}
+}
