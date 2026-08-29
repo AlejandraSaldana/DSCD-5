@@ -20,7 +20,7 @@ logging.basicConfig(
 )
 
 
-# DEFINE: contrato de configuracion del pipeline 
+# DEFINE: contrato de configuracion del pipeline
 @dataclass(frozen=True)
 class ETLConfig:
     database_path: Path
@@ -260,14 +260,275 @@ def integrate(
 
     return merged, reconciliation
 
+# QUALITY GATE: compara las métricas reales contra los umbrales definidos para A2
+def quality_gate(
+    config: ETLConfig,
+    valid_shipments: pd.DataFrame,
+    quarantine: pd.DataFrame,
+    reconciliation: dict,
+) -> tuple[dict, str]:
+    total_shipments = len(valid_shipments) + len(quarantine)
+
+    unknown_carrier_rate = (
+        reconciliation["unknown_carrier"] / len(valid_shipments)
+        if len(valid_shipments) > 0
+        else 0.0
+    )
+
+    invalid_date_rate = (
+        len(quarantine) / total_shipments
+        if total_shipments > 0
+        else 0.0
+    )
+
+    metrics = {
+        "unknown_carrier_rate": unknown_carrier_rate,
+        "invalid_date_rate": invalid_date_rate,
+    }
+
+    unknown_carrier_pass = (
+        unknown_carrier_rate
+        <= config.quality_thresholds["unknown_carrier_rate_max"]
+    )
+
+    invalid_date_pass = (
+        invalid_date_rate
+        <= config.quality_thresholds["invalid_date_rate_max"]
+    )
+
+    status = "PASS" if unknown_carrier_pass and invalid_date_pass else "FAIL"
+
+    logging.info(
+        "QUALITY GATE: "
+        "unknown_carrier_rate=%.4f <= %.4f | "
+        "invalid_date_rate=%.4f <= %.4f | "
+        "status=%s",
+        unknown_carrier_rate,
+        config.quality_thresholds["unknown_carrier_rate_max"],
+        invalid_date_rate,
+        config.quality_thresholds["invalid_date_rate_max"],
+        status,
+    )
+
+    return metrics, status
+
+# LOAD: inserta o actualiza pedidos en orders_curated sin generar duplicados
+def load(
+    config: ETLConfig,
+    integrated: pd.DataFrame,
+    ) -> tuple[int, int]:
+    rows = integrated.copy()
+
+    def get_shipping_status(row):
+        if pd.isna(row["shipment_id"]):
+            return "no_valid_shipment"
+        if pd.isna(row["delivered_at"]):
+            return "in_transit"
+        return "delivered"
+
+
+    rows["shipping_status"] = rows.apply(get_shipping_status, axis=1)
+
+    rows["delivery_delay_days"] = (
+        rows["delivered_at"] - rows["shipped_at"]
+    ).dt.days
+
+    if "carrier_carrier_name" in rows.columns:
+        rows["carrier_name"] = rows["carrier_carrier_name"]
+    else:
+        rows["carrier_name"] = None
+
+    rows["carrier_name"] = rows["carrier_name"].fillna("Unknown")
+
+    curated = rows[
+        [
+            "order_id",
+            "shipping_status",
+            "delivery_delay_days",
+            "carrier_name",
+        ]
+    ].copy()
+
+    inserted = 0
+    updated = 0
+
+    with sqlite3.connect(config.database_path) as connection:
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {config.output_table} (
+                order_id INTEGER PRIMARY KEY,
+                shipping_status TEXT,
+                delivery_delay_days INTEGER,
+                carrier_name TEXT
+            )
+            """
+        )
+
+        for _, row in curated.iterrows():
+            exists = connection.execute(
+                f"SELECT 1 FROM {config.output_table} WHERE order_id = ?",
+                (int(row["order_id"]),),
+            ).fetchone()
+
+            delay = (
+                None
+                if pd.isna(row["delivery_delay_days"])
+                else int(row["delivery_delay_days"])
+            )
+
+            connection.execute(
+                f"""
+                INSERT INTO {config.output_table}
+                    (order_id, shipping_status, delivery_delay_days, carrier_name)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    shipping_status = excluded.shipping_status,
+                    delivery_delay_days = excluded.delivery_delay_days,
+                    carrier_name = excluded.carrier_name
+                """,
+                (
+                    int(row["order_id"]),
+                    row["shipping_status"],
+                    delay,
+                    row["carrier_name"],
+                ),
+            )
+
+            if exists:
+                updated += 1
+            else:
+                inserted += 1
+
+        connection.commit()
+
+    logging.info(
+        "LOAD: %s insertados, %s actualizados (UPSERT) en %s",
+        inserted,
+        updated,
+        config.output_table,
+    )
+
+    return inserted, updated
+
+# QUARANTINE: guarda los registros inválidos junto con su motivo de rechazo
+def persist_quarantine(
+    config: ETLConfig,
+    quarantine: pd.DataFrame,
+    ) -> int:
+    if quarantine.empty:
+        return 0
+
+    with sqlite3.connect(config.database_path) as connection:
+        quarantine.to_sql(
+            config.quarantine_table,
+            connection,
+            if_exists="append",
+            index=False,
+        )
+
+    logging.info(
+        "QUARANTINE: %s registros guardados en %s",
+        len(quarantine),
+        config.quarantine_table,
+    )
+
+    return len(quarantine)
+
+# AUDIT: registra una fila por cada ejecución del pipeline
+def audit(
+    config: ETLConfig,
+    batch_id: str,
+    started_at: str,
+    watermark_before: str,
+    watermark_after: str,
+    source_orders: int,
+    valid_shipments: int,
+    quarantined_shipments: int,
+    inserted: int,
+    updated: int,
+    metrics: dict,
+    quality_status: str,
+    status: str,
+    ) -> None:
+    finished_at = pd.Timestamp.now("UTC").isoformat()
+
+    with sqlite3.connect(config.database_path) as connection:
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {config.audit_table} (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT,
+                finished_at TEXT,
+                watermark_before TEXT,
+                watermark_after TEXT,
+                source_orders INTEGER,
+                valid_shipments INTEGER,
+                quarantined_shipments INTEGER,
+                inserted INTEGER,
+                updated INTEGER,
+                unknown_carrier_rate REAL,
+                invalid_date_rate REAL,
+                quality_gate_status TEXT,
+                status TEXT
+            )
+            """
+        )
+
+        connection.execute(
+            f"""
+            INSERT INTO {config.audit_table} (
+                run_id,
+                started_at,
+                finished_at,
+                watermark_before,
+                watermark_after,
+                source_orders,
+                valid_shipments,
+                quarantined_shipments,
+                inserted,
+                updated,
+                unknown_carrier_rate,
+                invalid_date_rate,
+                quality_gate_status,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                started_at,
+                finished_at,
+                watermark_before,
+                watermark_after,
+                source_orders,
+                valid_shipments,
+                quarantined_shipments,
+                inserted,
+                updated,
+                metrics.get("unknown_carrier_rate"),
+                metrics.get("invalid_date_rate"),
+                quality_status,
+                status,
+            ),
+        )
+
+        connection.commit()
+
+    logging.info(
+        "AUDIT: run_id=%s status=%s registrado en %s",
+        batch_id,
+        status,
+        config.audit_table,
+    )
 
 def main() -> None:
     config = load_config()
+    started_at = pd.Timestamp.now("UTC").isoformat()
     batch_id = f"ETL_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S')}"
     watermark_before = read_watermark(config.watermark_path)
 
     logging.info(
-        "=== ETL A2 iniciado hasta VALIDATE | batch_id=%s ===", batch_id
+        "=== ETL A2 iniciado | batch_id=%s ===", batch_id
     )
     orders, shipments, carriers = extract(config, watermark_before)
 
@@ -275,6 +536,23 @@ def main() -> None:
         logging.info(
             "Sin pedidos nuevos desde el watermark: corrida incremental vacia"
         )
+
+        audit(
+            config=config,
+            batch_id=batch_id,
+            started_at=started_at,
+            watermark_before=watermark_before,
+            watermark_after=watermark_before,
+            source_orders=0,
+            valid_shipments=0,
+            quarantined_shipments=0,
+            inserted=0,
+            updated=0,
+            metrics={},
+            quality_status="SKIPPED",
+            status="SUCCESS",
+        )
+
         return
 
     staged_orders, staged_shipments, staged_carriers = stage(
@@ -282,6 +560,11 @@ def main() -> None:
     )
     valid_orders, valid_shipments, valid_carriers, quarantine = validate(
         staged_orders, staged_shipments, staged_carriers
+    )
+
+    persist_quarantine(
+        config,
+        quarantine,
     )
 
     carrier_columns = [
@@ -292,9 +575,67 @@ def main() -> None:
     carriers_lookup = (
         valid_carriers.set_index("carrier_code")[carrier_columns].to_dict("index")
     )
- 
+
     orders_t, latest_shipment = transform(valid_orders, valid_shipments)
     integrated, reconciliation = integrate(orders_t, latest_shipment, carriers_lookup)
+
+    metrics, quality_status = quality_gate(
+    config,
+    valid_shipments,
+    quarantine,
+    reconciliation,
+    )
+
+    if quality_status == "FAIL":
+        audit(
+            config=config,
+            batch_id=batch_id,
+            started_at=started_at,
+            watermark_before=watermark_before,
+            watermark_after=watermark_before,
+            source_orders=len(orders),
+            valid_shipments=len(valid_shipments),
+            quarantined_shipments=len(quarantine),
+            inserted=0,
+            updated=0,
+            metrics=metrics,
+            quality_status=quality_status,
+            status="FAILED",
+        )
+
+        raise RuntimeError("QUALITY GATE falló. No se ejecutará LOAD.")
+
+    inserted, updated = load(
+        config,
+        integrated,
+    )
+
+    watermark_after = (
+        pd.to_datetime(valid_orders["updated_at"])
+        .max()
+        .isoformat()
+    )
+
+    write_watermark(
+        config.watermark_path,
+        watermark_after,
+    )
+
+    audit(
+        config=config,
+        batch_id=batch_id,
+        started_at=started_at,
+        watermark_before=watermark_before,
+        watermark_after=watermark_after,
+        source_orders=len(orders),
+        valid_shipments=len(valid_shipments),
+        quarantined_shipments=len(quarantine),
+        inserted=inserted,
+        updated=updated,
+        metrics=metrics,
+        quality_status=quality_status,
+        status="SUCCESS",
+    )
 
 
     logging.info(
