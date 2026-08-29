@@ -19,12 +19,12 @@ logging.basicConfig(
 class ETLConfig:
     database_path: Path
     shipments_path: Path
-    carriers: Path
+    carriers_path: Path
     watermark_path: Path
     output_table: str
     quarantine_table: str
     audit_table: str
-    quality_thresholds: dict[float, float]
+    quality_thresholds: dict[str, float]
 
 
 def load_config() -> ETLConfig:
