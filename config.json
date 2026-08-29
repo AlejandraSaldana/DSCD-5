@@ -1,0 +1,13 @@
+{
+  "database_path": "data/orders.db",
+  "shipments_path": "data/shipments.csv",
+  "carriers_path": "data/carriers.json",
+  "watermark_path": "data/watermark.json",
+  "output_table": "orders_curated",
+  "quarantine_table": "shipments_quarantine",
+  "audit_table": "etl_runs",
+  "quality_thresholds": {
+    "unknown_carrier_rate_max": 0.25,
+    "invalid_date_rate_max": 0.20
+  }
+}
