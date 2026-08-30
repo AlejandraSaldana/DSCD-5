@@ -1,0 +1,105 @@
+===== 0. PREPARACION DEL ENTORNO =====
+Reutilizando entorno virtual existente en .venv (no se recrea).
+Instalando dependencias de requirements.txt en .venv ...
+
+[notice] A new release of pip is available: 25.2 -> 26.2.1
+[notice] To update, run: /Users/lira/DSCD-5/.venv/bin/python3.13 -m pip install --upgrade pip
+Entorno listo: .venv/bin/python
+
+===== 1. SEMBRADO DE LA BASE (seed_database.py) =====
+Recrea data/orders.db desde cero con los 5 pedidos de la semilla,
+incluyendo el envio S6 (order_id 104) que dispara delivered_before_shipped.
+Sembrados 5 ordenes en /Users/lira/DSCD-5/data/orders.db
+
+===== 2. RESET DE WATERMARK (arranque limpio de la demo) =====
+watermark reseteado -> data/watermark.json = last_processed_updated_at 1900-01-01
+
+===== CORRIDA 1: carga inicial =====
+Evidencia esperada: los 5 pedidos se leen como nuevos, el envio S6
+(order_id 104, delivered_at < shipped_at) cae en cuarentena con el
+motivo exacto 'delivered_before_shipped', y al final el Quality Gate
+imprime sus metricas contra los umbrales de config.json con veredicto PASS/FAIL.
+[23:26:10] INFO === ETL A2 iniciado | watermark=1900-01-01 ===
+[23:26:10] INFO EXTRACT: 5 pedidos nuevos/modificados desde watermark=1900-01-01 | 6 envios | 2 transportistas
+[23:26:10] INFO batch_id asignado=ETL_1900-01-01_2026-08-20
+[23:26:10] INFO STAGE: batch_id=ETL_1900-01-01_2026-08-20 asignado a las tres fuentes
+[23:26:10] INFO VALIDATE: pedidos validos=5 | envios validos=5 quarantine=1 | transportistas=2
+[23:26:10] INFO Cuarentena:
+   source                  batch_id  order_id shipment_id         rejection_reason
+shipments ETL_1900-01-01_2026-08-20       104          S6 delivered_before_shipped
+[23:26:10] INFO TRANSFORM: 5 pedidios transformados | 4 envíos más recientes (de 5 envíos)
+[23:26:10] INFO INTEGRATE: {'rows_before': 5, 'rows_after': 5, 'matched_with_shipment': 4, 'unmatched_shipment': 1, 'duplicated_order_id': 0, 'unknown_carrier': 1}
+[23:26:10] INFO BUILD_CURATED: 5 pedidos consolidados | delivered=3 in_transit=2 | carrier desconocido=2
+[23:26:10] INFO QUALITY_GATE: unknown_carrier_rate=0.2000 (umbral<=0.2500) -> PASS | invalid_date_rate=0.1667 (umbral<=0.2000) -> PASS | veredicto global=PASS
+[23:26:10] INFO LOAD: 5 filas upsert en orders_curated | 1 filas insertadas/ignoradas en shipments_quarantine
+[23:26:10] INFO AUDIT: corrida batch_id=ETL_1900-01-01_2026-08-20 registrada con status=PASS
+[23:26:10] INFO === Resumen: pedidos=5 | envios validos=5 | cuarentena=1 | cargados=5 | watermark 1900-01-01 -> 2026-08-20 | status=PASS ===
+
+----- Conteo de filas tras la CORRIDA 1 -----
+SELECT count(*) FROM orders_curated  ->  5
+SELECT count(*) FROM shipments_quarantine  ->  1
+
+===== RESET DE WATERMARK ANTES DE LA CORRIDA 2 =====
+Se resetea el watermark a 1900-01-01 otra vez, SIN volver a sembrar la
+base, para forzar que el pipeline vea de nuevo los mismos 5 pedidos ya
+cargados. Esto es lo que permite demostrar que el LOAD es idempotente:
+si orders_curated no duplica filas al reprocesar exactamente los mismos
+datos, la carga esta haciendo upsert/merge por clave y no un INSERT ciego.
+watermark reseteado -> data/watermark.json = last_processed_updated_at 1900-01-01
+
+===== CORRIDA 2: reproceso de los mismos pedidos (prueba de idempotencia) =====
+[23:26:11] INFO === ETL A2 iniciado | watermark=1900-01-01 ===
+[23:26:11] INFO EXTRACT: 5 pedidos nuevos/modificados desde watermark=1900-01-01 | 6 envios | 2 transportistas
+[23:26:11] INFO batch_id asignado=ETL_1900-01-01_2026-08-20
+[23:26:11] INFO STAGE: batch_id=ETL_1900-01-01_2026-08-20 asignado a las tres fuentes
+[23:26:11] INFO VALIDATE: pedidos validos=5 | envios validos=5 quarantine=1 | transportistas=2
+[23:26:11] INFO Cuarentena:
+   source                  batch_id  order_id shipment_id         rejection_reason
+shipments ETL_1900-01-01_2026-08-20       104          S6 delivered_before_shipped
+[23:26:11] INFO TRANSFORM: 5 pedidios transformados | 4 envíos más recientes (de 5 envíos)
+[23:26:11] INFO INTEGRATE: {'rows_before': 5, 'rows_after': 5, 'matched_with_shipment': 4, 'unmatched_shipment': 1, 'duplicated_order_id': 0, 'unknown_carrier': 1}
+[23:26:11] INFO BUILD_CURATED: 5 pedidos consolidados | delivered=3 in_transit=2 | carrier desconocido=2
+[23:26:11] INFO QUALITY_GATE: unknown_carrier_rate=0.2000 (umbral<=0.2500) -> PASS | invalid_date_rate=0.1667 (umbral<=0.2000) -> PASS | veredicto global=PASS
+[23:26:11] INFO LOAD: 5 filas upsert en orders_curated | 1 filas insertadas/ignoradas en shipments_quarantine
+[23:26:11] INFO AUDIT: corrida batch_id=ETL_1900-01-01_2026-08-20 registrada con status=PASS
+[23:26:11] INFO === Resumen: pedidos=5 | envios validos=5 | cuarentena=1 | cargados=5 | watermark 1900-01-01 -> 2026-08-20 | status=PASS ===
+
+----- Conteo de filas tras la CORRIDA 2 (debe ser IGUAL al de la CORRIDA 1) -----
+SELECT count(*) FROM orders_curated  ->  5
+SELECT count(*) FROM shipments_quarantine  ->  1
+
+===== CORRIDA 3: sin datos nuevos (watermark ya avanzado) =====
+No se toca el watermark: la CORRIDA 2 ya lo dejo en la fecha mas reciente
+procesada (2026-08-20 con la semilla actual), asi que el pipeline no debe
+encontrar pedidos con updated_at mayor y debe procesar 0 filas.
+[23:26:11] INFO === ETL A2 iniciado | watermark=2026-08-20 ===
+[23:26:11] INFO EXTRACT: 0 pedidos nuevos/modificados desde watermark=2026-08-20 | 6 envios | 2 transportistas
+[23:26:11] INFO Sin pedidos nuevos desde el watermark: corrida incremental vacia (0 filas procesadas) | batch_id=ETL_20260830_052611
+[23:26:11] INFO AUDIT: corrida batch_id=ETL_20260830_052611 registrada con status=SKIPPED_NO_DATA
+[23:26:11] INFO === Resumen: rows_extracted=0 | status=SKIPPED_NO_DATA ===
+
+----- Conteo de filas tras la CORRIDA 3 (debe seguir IGUAL, no hubo carga nueva) -----
+SELECT count(*) FROM orders_curated  ->  5
+SELECT count(*) FROM shipments_quarantine  ->  1
+
+===== TABLAS FINALES =====
+--- orders_curated (orders_curated) ---
+ order_id  customer_id order_date  status shipping_status  delivery_delay_days carrier_name shipment_id carrier_code                  batch_id                      ingested_at
+      100         1001 2026-08-09 shipped       delivered                  5.0  DHL Express          S2          DHL ETL_1900-01-01_2026-08-20 2026-08-30T05:26:11.007288+00:00
+      101         1002 2026-08-10 shipped       delivered                  2.0        FedEx          S3          FDX ETL_1900-01-01_2026-08-20 2026-08-30T05:26:11.007288+00:00
+      102         1003 2026-08-13 shipped      in_transit                  NaN        FedEx          S4          FDX ETL_1900-01-01_2026-08-20 2026-08-30T05:26:11.007288+00:00
+      103         1004 2026-08-15 shipped       delivered                  2.0  desconocido          S5          XYZ ETL_1900-01-01_2026-08-20 2026-08-30T05:26:11.007288+00:00
+      104         1005 2026-08-19 shipped      in_transit                  NaN  desconocido         NaN          NaN ETL_1900-01-01_2026-08-20 2026-08-30T05:26:11.007288+00:00
+
+--- shipments_quarantine (shipments_quarantine) ---
+ id    source                  batch_id  order_id shipment_id         rejection_reason
+  1 shipments ETL_1900-01-01_2026-08-20       104          S6 delivered_before_shipped
+
+--- etl_runs (etl_runs) ---
+ id                  batch_id                       started_at                      finished_at watermark_before watermark_after  rows_extracted  rows_valid  rows_quarantined  rows_loaded  unknown_carrier_rate  invalid_date_rate          status
+  1 ETL_1900-01-01_2026-08-20 2026-08-30T05:26:10.753525+00:00 2026-08-30T05:26:10.772807+00:00       1900-01-01      2026-08-20               5           5                 1            5                   0.2           0.166667            PASS
+  2 ETL_1900-01-01_2026-08-20 2026-08-30T05:26:11.005501+00:00 2026-08-30T05:26:11.015091+00:00       1900-01-01      2026-08-20               5           5                 1            5                   0.2           0.166667            PASS
+  3       ETL_20260830_052611 2026-08-30T05:26:11.226514+00:00 2026-08-30T05:26:11.228268+00:00       2026-08-20      2026-08-20               0           0                 0            0                   NaN                NaN SKIPPED_NO_DATA
+
+
+===== FIN DE LA DEMO =====
